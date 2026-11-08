@@ -1,11 +1,5 @@
 import { errorText, fetchText, htmlText, parseFeed, publicUrl, readPage, type ResearchResult } from "./core";
-
-const CITY_PINYIN: Record<string, string> = {
-  大理: "dali", 昆明: "km", 成都: "cd", 丽江: "lijiang", 三亚: "sanya", 北海: "beihai", 威海: "weihai", 海口: "haikou",
-  杭州: "hz", 苏州: "su", 厦门: "xm", 青岛: "qd", 广州: "gz", 深圳: "sz", 重庆: "cq", 西安: "xa", 长沙: "cs", 武汉: "wh",
-  南京: "nj", 天津: "tj", 上海: "sh", 北京: "bj", 贵阳: "gy", 桂林: "guilin", 珠海: "zh", 佛山: "fs", 东莞: "dg", 南宁: "nn",
-  大理白族自治州: "dali", 腾冲: "tengchong", 西双版纳: "xishuangbanna", 建水: "jianshui", 伊春: "yichun", 鹤岗: "hegang",
-};
+import { facilityEntries, rentEntries, validateSourceContent, type SourceEntry } from "./sources";
 
 const CITY_CODES: Record<string, string> = {
   大理: "101290201", 昆明: "101290101", 丽江: "101291401", 成都: "101270101", 三亚: "101310201", 北海: "101301301",
@@ -15,7 +9,6 @@ const CITY_CODES: Record<string, string> = {
   腾冲: "101290503", 西双版纳: "101291601",
 };
 
-type Entry = { source: string; url: string; title: string };
 type Video = { title: string; url: string; author: string; plays: string | number };
 
 const SOURCES: Record<string, string> = { douban: "豆瓣租房小组", anjuke: "安居客", ke: "贝壳/链家", dianping: "大众点评关键词", city: "大众点评城市页" };
@@ -26,12 +19,17 @@ function response(query: string, results: ResearchResult[], status = 200, videos
   });
 }
 
-async function readEntries(entries: Entry[]): Promise<ResearchResult[]> {
+async function readEntries(entries: SourceEntry[]): Promise<ResearchResult[]> {
   const results: ResearchResult[] = [];
   // Preserve the original tool's source order and independent failure reporting.
   for (const entry of entries) {
-    try { results.push({ ...entry, content: await readPage(entry.url), status: "success" }); }
-    catch (error) { results.push({ ...entry, content: errorText(error), status: "error" }); }
+    const result = { source: entry.source, title: entry.title, url: entry.url };
+    try {
+      if (entry.unavailable) throw new Error(entry.unavailable);
+      const content = await readPage(entry.url);
+      validateSourceContent(entry, content);
+      results.push({ ...result, content, status: "success" });
+    } catch (error) { results.push({ ...result, content: errorText(error), status: "error" }); }
   }
   return results;
 }
@@ -50,20 +48,14 @@ export async function GET(request: Request) {
   try {
     if (!["rent", "weather", "facilities", "bili", "read", "feeds"].includes(type)) throw new Error("未知检索类型，请选择租房、天气、周边、视频、网页或 RSS。");
     if (["rent", "weather", "facilities", "bili"].includes(type) && !city) throw new Error("请先填写城市名称。");
-    const pinyin = CITY_PINYIN[city] || (/^[a-z][a-z0-9-]{0,39}$/i.test(city) ? city : "");
-    let entries: Entry[] = [];
+    let entries: SourceEntry[] = [];
 
     if (type === "rent") {
-      entries = [
-        { source: "豆瓣租房小组", title: `${city} · ${keyword || "租房信息"}`, url: `https://www.douban.com/group/search?cat=1019&q=${encodeURIComponent(query)}` },
-        { source: "安居客", title: `${city}租房 · ${keyword || "全部房源"}`, url: `https://zu.anjuke.com/fangyuan/${encodeURIComponent(city)}/${keyword ? `${encodeURIComponent(keyword)}/` : ""}` },
-      ];
-      if (pinyin) entries.push({ source: "贝壳/链家", title: `${city}${district} · 租房`, url: `https://${pinyin}.zu.ke.com/zufang/${district ? `${encodeURIComponent(district)}/` : ""}` });
+      entries = rentEntries(city, keyword, district);
       const wanted = SOURCES[source] || source;
       if (source !== "all") entries = entries.filter((entry) => entry.source.includes(wanted));
       if (!entries.length) throw new Error("未识别该租房来源，可选：豆瓣租房小组、安居客、贝壳/链家。");
       const results = await readEntries(entries);
-      if (!pinyin && (source === "all" || wanted === "贝壳/链家")) results.push({ title: `${city} · 租房`, source: "贝壳/链家", url: "https://www.ke.com/", content: "该城市暂无内置站点拼音映射，请使用城市拼音或打开贝壳网站选择城市。", status: "error" });
       return response(query, results);
     }
 
@@ -74,11 +66,7 @@ export async function GET(request: Request) {
     }
 
     if (type === "facilities") {
-      if (!pinyin) throw new Error("该城市暂无内置拼音映射，请使用城市拼音重试。");
-      entries = [
-        { source: "大众点评城市页", title: `${city} · 生活服务`, url: `https://www.dianping.com/${pinyin}/` },
-        { source: "大众点评关键词", title: `${city} · ${keyword || "周边设施"}`, url: `https://www.dianping.com/${pinyin}/search/keyword/0_${encodeURIComponent(keyword || "菜市场")}` },
-      ];
+      entries = facilityEntries(city, keyword);
       if (source !== "all") entries = entries.filter((entry) => entry.source.includes(SOURCES[source] || source));
       if (!entries.length) throw new Error("未识别该设施来源，可选：大众点评城市页、大众点评关键词。");
       return response(query, await readEntries(entries));

@@ -2,6 +2,29 @@ const TIMEOUT_MS = 10_000;
 const MAX_BYTES = 1_500_000;
 const MAX_CONTENT = 24_000;
 const USER_AGENT = "Mozilla/5.0 (compatible; SlowStay/1.0; travel research)";
+const BLOCKED_MESSAGE = "网站返回了安全验证或登录页面，未获取到目标正文。可打开来源页查看。";
+
+export function networkConfig() {
+  const env: Record<string, string | undefined> = typeof process === "undefined" ? {} : process.env;
+  const configured = env.RESEARCH_DNS_ENDPOINTS?.trim();
+  const dnsEndpoints = (configured ? configured.split(",") : [
+    "https://dns.alidns.com/resolve", "https://cloudflare-dns.com/dns-query",
+  ]).map((value) => {
+    const url = publicUrl(value.trim());
+    if (url.protocol !== "https:" || url.search) throw new Error("DNS 配置必须为不含查询参数的公开 HTTPS JSON DoH 地址。");
+    return url.toString();
+  });
+  if (!dnsEndpoints.length || dnsEndpoints.length > 3) throw new Error("DNS 配置需要 1–3 个解析服务地址。");
+  const timeout = (value: string | undefined, fallback: number, min: number, max: number) => {
+    const number = Number(value);
+    return value && Number.isFinite(number) ? Math.min(max, Math.max(min, Math.floor(number))) : fallback;
+  };
+  return {
+    dnsEndpoints,
+    dnsTimeoutMs: timeout(env.RESEARCH_DNS_TIMEOUT_MS, 2500, 500, 5000),
+    fetchTimeoutMs: timeout(env.RESEARCH_FETCH_TIMEOUT_MS, TIMEOUT_MS, 1000, 20_000),
+  };
+}
 
 export type ResearchResult = {
   title: string;
@@ -67,12 +90,32 @@ export function decodeEntities(value: string): string {
 }
 
 export function blockedPage(text: string): boolean {
-  const sample = text.slice(0, 14_000).toLowerCase();
-  return /requiring captcha|captcha verification|performing security verification|attention required![\s\S]*cloudflare|<title>\s*just a moment|title: just a moment|\/cdn-cgi\/challenge-platform\//.test(sample) ||
-    /^title:\s*[^\n]*(?:安全验证|访问验证|验证中心|访问受限|验证码|登录|\blogin\b)/im.test(sample) ||
-    /<title>[^<]*(?:安全验证|访问验证|验证中心|访问受限|验证码|登录|login)/i.test(sample) ||
-    /(?:安全验证|请完成验证|拖动滑块|访问过于频繁|异常访问|访问被拒绝|请登录后|登录后查看更多|检测到有异常请求|请输入验证码|访问行为异常|验证后继续访问)/.test(sample) ||
-    /warning:[^\n]*(?:403|429|forbidden)|target url returned error (?:403|429)/i.test(sample);
+  // Inspect visible text, not scripts/hidden challenge implementation in an otherwise valid page.
+  const sample = htmlText(text).slice(0, 14_000).toLowerCase();
+  if (/requiring captcha|captcha verification|performing security verification|attention required![\s\S]*cloudflare|title: just a moment/.test(sample) ||
+      /^title:\s*[^\n]*(?:安全验证|访问验证|验证中心|访问受限|验证码|登录|\blogin\b)/im.test(sample) ||
+      /<title>[^<]*(?:just a moment|安全验证|访问验证|验证中心|访问受限|验证码|登录|login)/i.test(text) ||
+      /https?:\/\/[^\s<>]*\/(?:antibot\/verifycode|cdn-cgi\/challenge-platform)(?:[/?\s]|$)/i.test(sample) ||
+      /["']verifyPageUrl["']\s*:/i.test(sample) ||
+      /warning:[^\n]*(?:403|429|forbidden)|target url returned error (?:403|429)/i.test(sample)) return true;
+  // Short authentication-only bodies include the plain-text Dianping login response.
+  // A long article/listing with a login link or widget must remain readable.
+  const body = htmlText(text.replace(/<(nav|header|footer|aside|form)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, " "));
+  const hasBodyParagraph = body.split("\n").some((line) => line.trim().length >= 40 &&
+    !/(?:扫码|二维码|登录|注册|验证码|关于我们|版权|all rights|©|https?:\/\/)/i.test(line));
+  return sample.length < 3000 && (
+    /(?:请完成验证|拖动滑块|访问过于频繁|异常访问|访问被拒绝|请登录后|登录后查看更多|检测到有异常请求|请输入验证码|访问行为异常|验证后继续访问)/.test(sample) ||
+    (!hasBodyParagraph && /(?:app扫码|扫描二维码登录|扫码登录|账号登录\/注册|账号密码登录|sign in to continue|log in to continue)/i.test(sample)) ||
+    /^(?:大众点评网\s*)?(?:登录|login|sign in)\s*$/i.test(sample.trim())
+  );
+}
+
+export function readablePage(text: string): string {
+  if (blockedPage(text)) throw new Error(BLOCKED_MESSAGE);
+  if (/target url returned error (?:404|500|502|503)|warning:.*(?:404|500|502|503)/i.test(text)) throw new Error("目标网页暂无可读内容。");
+  const clean = htmlText(text);
+  if (clean.length < 40 || /^https?:\/\/\S+\s*$/.test(clean)) throw new Error("网站未返回足够的可读正文，可能需要登录或由浏览器加载。");
+  return clean.slice(0, MAX_CONTENT);
 }
 
 function decodeBody(bytes: Uint8Array, contentType: string): string {
@@ -106,32 +149,49 @@ async function responseText(response: Response, maxBytes: number): Promise<strin
   return decodeBody(body, response.headers.get("content-type") || "");
 }
 
-async function ensurePublicHost(host: string): Promise<void> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  try {
-    const replies = await Promise.all(["A", "AAAA"].map(async (type) => {
-      const response = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=${type}`, {
-        headers: { Accept: "application/dns-json" }, signal: controller.signal, redirect: "error",
-      });
-      if (!response.ok) throw new Error("无法校验网站地址，请稍后重试。");
-      const data = JSON.parse(await responseText(response, 100_000)) as { Answer?: { type: number; data: string }[] };
-      return (data.Answer || []).filter((item) => item.type === 1 || item.type === 28).map((item) => item.data);
-    }));
-    const addresses = replies.flat();
+export async function ensurePublicHost(host: string): Promise<void> {
+  const { dnsEndpoints, dnsTimeoutMs } = networkConfig();
+  for (const endpoint of dnsEndpoints) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), dnsTimeoutMs);
+    let addresses: string[];
+    try {
+      const replies = await Promise.allSettled([1, 28].map(async (type) => {
+        const url = new URL(endpoint);
+        url.searchParams.set("name", host);
+        url.searchParams.set("type", String(type));
+        const response = await fetch(url.toString(), {
+          // Workerd supports manual/follow, not the browser's redirect:error.
+          // Reject 3xx with all other non-2xx responses below.
+          headers: { Accept: "application/dns-json" }, signal: controller.signal, redirect: "manual",
+        });
+        if (!response.ok) { await response.body?.cancel(); throw new Error("DNS transport failed"); }
+        const data = JSON.parse(await responseText(response, 100_000)) as { Status?: number; Answer?: { type: number; data: string }[] };
+        if (data.Status !== 0 && data.Status !== 3) throw new Error("DNS resolver failed");
+        return (data.Answer || []).filter((item) => item.type === 1 || item.type === 28).map((item) => item.data);
+      }));
+      addresses = replies.flatMap((reply) => reply.status === "fulfilled" ? reply.value : []);
+      // Check even partial answers before considering transport failover.
+      if (addresses.some((address) => !isPublicAddress(address))) throw new Error("private_address");
+      if (replies.some((reply) => reply.status === "rejected")) throw new Error("DNS transport failed");
+    } catch (error) {
+      // Only transport/resolver failures may try another resolver. A private or
+      // empty answer below must never fall through to a more permissive answer.
+      controller.abort();
+      if (error instanceof Error && error.message === "private_address") throw new Error("网站地址指向内网或保留网络，无法读取。");
+      continue;
+    } finally { clearTimeout(timer); }
     if (!addresses.length) throw new Error("未找到该网站的公开地址，请检查网址。");
     if (addresses.some((address) => !isPublicAddress(address))) throw new Error("网站地址指向内网或保留网络，无法读取。");
-  } catch (error) {
-    controller.abort();
-    if (error instanceof Error && /^(无法校验|未找到|网站地址)/.test(error.message)) throw error;
-    throw new Error("无法校验网站的公开地址，请稍后重试。");
-  } finally { clearTimeout(timer); }
+    return;
+  }
+  throw new Error("DNS 校验服务暂时无法连接，请检查服务器网络或 RESEARCH_DNS_ENDPOINTS 配置；未放行目标网站。");
 }
 
 export async function fetchText(value: string, options: { headers?: Record<string, string>; verifyDns?: boolean } = {}): Promise<string> {
   let url = publicUrl(value);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), networkConfig().fetchTimeoutMs);
   try {
     for (let hop = 0; hop <= 3; hop++) {
       if (options.verifyDns) await ensurePublicHost(url.hostname);
@@ -158,7 +218,7 @@ export async function fetchText(value: string, options: { headers?: Record<strin
         throw new Error("该链接不是可读取的网页、文本或订阅源。");
       }
       const text = await responseText(response, MAX_BYTES);
-      if (blockedPage(text)) throw new Error("网站返回了安全验证或登录页面，未获取到目标正文。可打开来源页查看。");
+      if (blockedPage(text)) throw new Error(BLOCKED_MESSAGE);
       return text;
     }
     throw new Error("网站重定向次数过多，已停止读取。");
@@ -171,16 +231,14 @@ export async function fetchText(value: string, options: { headers?: Record<strin
 
 export async function readPage(value: string, untrustedUrl = false): Promise<string> {
   const url = publicUrl(value).toString();
-  if (untrustedUrl) await ensurePublicHost(new URL(url).hostname);
+  // Reader services follow redirects remotely. User-supplied URLs use direct
+  // fetching so every redirect remains visible to our public-address checks.
+  if (untrustedUrl) return readablePage(await fetchText(url, { verifyDns: true }));
   try {
     const text = await fetchText(`https://r.jina.ai/${url}`, { headers: { Accept: "text/plain" } });
-    if (!text.trim() || /target url returned error (?:404|500|502|503)|warning:.*(?:404|500|502|503)/i.test(text)) throw new Error("目标网页暂无可读内容。");
-    return text.slice(0, MAX_CONTENT);
+    return readablePage(text);
   } catch {
-    const text = await fetchText(url, { verifyDns: untrustedUrl });
-    const clean = htmlText(text);
-    if (clean.length < 40) throw new Error("网站未返回足够的可读正文，可能需要登录或由浏览器加载。");
-    return clean.slice(0, MAX_CONTENT);
+    return readablePage(await fetchText(url));
   }
 }
 
@@ -202,7 +260,8 @@ export function parseFeed(xml: string, feedUrl: string, limit: number): Research
     const href = atomLink?.match(/\bhref\s*=\s*["']([^"']+)["']/i)?.[1] || tag(block, "link");
     let url = feedUrl;
     if (href.trim()) {
-      try { url = publicUrl(new URL(decodeEntities(href.trim()), feedUrl).toString()).toString(); } catch { /* Keep the publicly validated feed URL for malformed links. */ }
+      const link = decodeEntities(href.trim().replace(/^<!\[CDATA\[([\s\S]*?)\]\]>$/, "$1").trim());
+      try { url = publicUrl(new URL(link, feedUrl).toString()).toString(); } catch { /* Keep the publicly validated feed URL for malformed links. */ }
     }
     return {
       title: htmlText(tag(block, "title")).slice(0, 250) || "未命名资讯",
